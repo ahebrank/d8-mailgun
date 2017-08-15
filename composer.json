@@ -1,5 +1,5 @@
 {
-  "name": "drupal/mailgun",
+  "name": "ahebrank/d8-mailgun",
   "type": "drupal-module",
   "require": {
     "mailgun/mailgun-php": ">=2.3",
