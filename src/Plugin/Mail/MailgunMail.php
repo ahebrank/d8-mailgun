@@ -8,8 +8,10 @@
 namespace Drupal\mailgun\Plugin\Mail;
 
 use Drupal\Core\Mail\MailInterface;
-use Drupal\mailgun\DrupalMailgun;
 use Drupal\Component\Utility\Html;
+use Drupal\Core\Queue\QueueFactory;
+use Drupal\Core\Queue\QueueInterface;
+use Mailgun\Mailgun;
 
 /**
  * Modify the Drupal mail system to use Mandrill when sending emails.
@@ -21,6 +23,21 @@ use Drupal\Component\Utility\Html;
  * )
  */
 class MailgunMail implements MailInterface {
+
+  /**
+   * Configuration object
+   *
+   * @var \Drupal\Core\Config\ImmutableConfig
+   */
+  protected $drupalConfig;
+
+  /** @var LoggerInterface logger */
+  protected $logger;
+
+  public function __construct() {
+    $this->drupalConfig = \Drupal::config('mailgun.settings');
+    $this->logger = \Drupal::logger('mailgun');
+  }
 
   /**
    * Concatenate and wrap the e-mail body for either plain-text or HTML e-mails.
@@ -37,12 +54,12 @@ class MailgunMail implements MailInterface {
       $message['body'] = implode("\n\n", $message['body']);
     }
 
-    // todo fix this after adding configuration page
-//    // If a text format is specified in Mailgun settings, run the message through it.
-//    $format = variable_get('mailgun_format', '_none');
-//    if ($format != '_none') {
-//      $message['body'] = check_markup($message['body'], $format);
-//    }
+    // If a text format is specified in Mailgun settings, run the message through it.
+    $format = $this->drupalConfig->get('format_filter');
+
+    if (!empty($format)) {
+      $message['body'] = check_markup($message['body'], $format, $message['langcode']);
+    }
 
     return $message;
   }
@@ -77,23 +94,6 @@ class MailgunMail implements MailInterface {
       $mailgun_message['bcc'] = $message['params']['bcc'];
     }
 
-    $params = array();
-
-    // todo fix the following with configuration
-//    // Populate default settings.
-//    $variable = variable_get('mailgun_tracking', 'default')
-//    if ($variable != 'default') {
-//      $params['o:tracking'] = $variable;
-//    }
-//    $variable = variable_get('mailgun_tracking_clicks', 'default')
-//    if ($variable != 'default') {
-//      $params['o:tracking-clicks'] = $variable;
-//    }
-//    $variable = variable_get('mailgun_tracking_opens', 'default')
-//    if ($variable != 'default') {
-//      $params['o:tracking-opens'] = $variable;
-//    }
-
     // For a full list of allowed parameters, see: https://documentation.mailgun.com/api-sending.html#sending.
     $allowed_params = array('o:tag', 'o:campaign', 'o:deliverytime', 'o:dkim', 'o:testmode', 'o:tracking', 'o:tracking-clicks', 'o:tracking-opens');
     foreach ($message['params'] as $key => $value) {
@@ -112,26 +112,79 @@ class MailgunMail implements MailInterface {
 
     // Make sure the files provided in the attachments array exist.
     if (!empty($message['params']['attachments'])) {
-      $params['attachments'] = array();
+      $attachments = [];
       foreach ($message['params']['attachments'] as $attachment) {
         if (file_exists($attachment)) {
-          $params['attachments'][] = $attachment;
+          $attachments[] = $attachment;
         }
+      }
+      if (count($attachments) > 0) {
+        $mailgun_message['attachments'] = $attachments;
       }
     }
 
-    $mailgun_message['params'] = $params;
+    if ($this->checkTracking($message)) {
+      $track_opens = $this->drupalConfig->get('tracking_opens');
 
-    // todo enable queueing of message
-//    // Queue the message if the setting is enabled.
-//    if (variable_get('mailgun_queue', FALSE)) {
-//      $queue = DrupalQueue::get('mailgun_queue', TRUE);
-//      $queue->createItem($mailgun_message);
-//      return TRUE;
-//    }
+      if (!empty($track_opens)) {
+        $mailgun_message['o:tracking-opens'] = $track_opens;
+      }
 
-    $mailgun = new DrupalMailgun();
-    
-    return $mailgun->send($mailgun_message);
+     $track_clicks = $this->drupalConfig->get('tracking_clicks');
+
+      if (!empty($track_clicks)) {
+        $mailgun_message['o:tracking-clicks'] = $track_opens;
+      }
+    }
+    else {
+      $mailgun_message['o:tracking'] = 'no';
+    }
+
+    if ($this->drupalConfig->get('use_queue')) {
+      /** @var QueueFactory $queue_factory */
+      $queue_factory = \Drupal::service('queue');
+
+      /** @var QueueInterface $queue */
+      $queue = $queue_factory->get('mailgun_send_mail');
+
+      $item = new \stdClass();
+      $item->message = $mailgun_message;
+      $queue->createItem($item);
+
+      // Debug mode: log all messages.
+      if ($this->drupalConfig->get('debug_mode')) {
+        $this->logger->notice('Successfully queued message from %from to %to.',
+          [
+            '%from' => $mailgun_message['from'],
+            '%to' => $mailgun_message['to']
+          ]
+        );
+      }
+
+      return TRUE;
+    }
+
+    return \Drupal::service('mailgun.mail_handler')->sendMail($mailgun_message);
   }
+
+   /**
+   * Checks, if the mail key is excempted from tracking
+   *
+   * @param array $message
+   *  A message array
+   *
+   * @return bool
+   *  TRUE if the tracking is allowed, otherwise FALSE
+   */
+  protected function checkTracking(array $message) {
+    $tracking = true;
+    $tracking_exception = $this->drupalConfig->get('tracking_exception');
+
+    if (!empty($tracking_exception)) {
+      $tracking = !in_array($message['module'] . ':' . $message['key'], explode("\n", $tracking_exception));
+    }
+
+    return $tracking;
+  }
+
 }
